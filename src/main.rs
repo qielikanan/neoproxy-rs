@@ -76,6 +76,13 @@ async fn main() -> Result<()> {
 // 服务端主逻辑 (Server)
 // ============================================================================
 async fn run_server(app_cfg: AppConfig) -> Result<()> {
+    if app_cfg.security != "tls" {
+        tracing::warn!(
+            "当前 Rust 版本暂且仅支持 'tls' 模式，配置的 '{}' 将作 tls 处理",
+            app_cfg.security
+        );
+    }
+
     let listen_addr = app_cfg.listen.unwrap_or_else(|| "0.0.0.0:8443".to_string());
     let dest = app_cfg.dest.unwrap_or_else(|| "127.0.0.1:80".to_string());
     let password = app_cfg
@@ -143,6 +150,13 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
 // 客户端主逻辑 (Client)
 // ============================================================================
 async fn run_client(app_cfg: AppConfig) -> Result<()> {
+    if app_cfg.security != "tls" {
+        tracing::warn!(
+            "当前 Rust 版本暂且仅支持 'tls' 模式，配置的 '{}' 将作 tls 处理",
+            app_cfg.security
+        );
+    }
+
     let listen_addr = app_cfg
         .listen
         .unwrap_or_else(|| "127.0.0.1:1080".to_string());
