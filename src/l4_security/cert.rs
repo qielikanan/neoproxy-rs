@@ -30,17 +30,13 @@ pub fn load_private_key<P: AsRef<Path>>(path: P) -> io::Result<PrivateKeyDer<'st
 pub fn generate_dummy_cert(
     domain: &str,
 ) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    // 使用 rcgen 生成自签名证书，指定 SNI 域名
-    let cert = rcgen::generate_simple_self_signed(vec![domain.to_string()])
+    let certified = rcgen::generate_simple_self_signed(vec![domain.to_string()])
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("证书生成失败: {}", e)))?;
 
-    // 序列化为 DER 二进制格式
-    let cert_der_bytes = cert
-        .serialize_der()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("证书序列化失败: {}", e)))?;
-    let key_der_bytes = cert.serialize_private_key_der();
+    let cert_der_bytes = certified.cert.der().to_vec();
 
-    // 转换为 rustls 支持的强类型
+    let key_der_bytes = certified.signing_key.serialize_der();
+
     let cert_der = CertificateDer::from(cert_der_bytes);
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der_bytes));
 
