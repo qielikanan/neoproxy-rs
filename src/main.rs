@@ -122,7 +122,7 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
         .jls_iv
         .unwrap_or_else(|| "3070111071563328618171495819203123318".to_string());
     let sni = app_cfg.sni.clone();
-    let padding_script = app_cfg.padding.clone();
+    let _padding_script = app_cfg.padding.clone();
     let security_mode = app_cfg.security.clone();
 
     let tls_config = if security_mode == "jls" {
@@ -159,7 +159,6 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
         let (tcp_stream, _) = listener.accept().await?;
         let config = tls_config.clone();
         let neomux_cfg_clone = neomux_cfg.clone();
-        let script = padding_script.clone();
         let mode_clone = security_mode.clone();
         let fallback_target = dest.clone();
 
@@ -170,7 +169,6 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
             };
 
             if mode_clone == "jls" {
-                // 修复：根据源码截图，精确匹配 AuthSuccess 元组变体
                 if !matches!(
                     tls_stream.jls_state(),
                     rustls::jls::JlsState::AuthSuccess(_)
@@ -180,8 +178,7 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
                 }
             }
 
-            let scheme = parse_script(&script).ok();
-            let shaper_stream = ShaperStream::new(tls_stream, scheme);
+            let shaper_stream = ShaperStream::new(tls_stream, None);
             let session = match Session::new(shaper_stream, neomux_cfg_clone).await {
                 Ok(s) => s,
                 Err(_) => return,
@@ -232,7 +229,6 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
             let tls = connect_tls(&config_clone, &sni_clone, tcp).await?;
 
             if mode_clone == "jls" {
-                // 修复：根据源码截图，精确匹配 AuthSuccess 元组变体
                 if !matches!(tls.jls_state(), rustls::jls::JlsState::AuthSuccess(_)) {
                     start_spider(tls, sni_clone).await;
                     return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "MITM"));
