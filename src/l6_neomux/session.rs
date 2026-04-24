@@ -45,6 +45,9 @@ impl Session {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::channel(128);
 
+        // 跨协程传递 Fallback 通道的利器
+        let (fallback_tx, fallback_rx) = mpsc::channel::<tokio::net::tcp::OwnedReadHalf>(1);
+
         let state = Arc::new(SessionState {
             streams: std::sync::Mutex::new(HashMap::new()),
             global_send_window: AtomicI32::new(10 * 1024 * 1024), // 10MB
@@ -83,7 +86,7 @@ impl Session {
         let write_prio_rx = prio_rx;
         let write_data_rx = data_rx;
         tokio::spawn(async move {
-            Self::write_loop(&mut wh, write_prio_rx, write_data_rx).await;
+            Self::write_loop(&mut wh, write_prio_rx, write_data_rx, fallback_rx).await;
         });
 
         let read_state = state.clone();
@@ -97,6 +100,7 @@ impl Session {
                 read_data_tx,
                 accept_tx,
                 config,
+                Some(fallback_tx),
             )
             .await;
         });
@@ -142,12 +146,25 @@ impl Session {
         writer: &mut W,
         mut prio_rx: mpsc::UnboundedReceiver<Frame>,
         mut data_rx: mpsc::UnboundedReceiver<Frame>,
+        mut fallback_rx: mpsc::Receiver<tokio::net::tcp::OwnedReadHalf>,
     ) where
         W: AsyncWrite + Unpin,
     {
+        let mut fallback_active = true;
+
         loop {
             let frame = tokio::select! {
                 biased;
+                // [机制核心]：如果收到 Fallback 的信号，中断多路复用写逻辑，化身纯粹的数据管道
+                opt_rh = fallback_rx.recv(), if fallback_active => {
+                    if let Some(mut target_rh) = opt_rh {
+                        let _ = tokio::io::copy(&mut target_rh, writer).await;
+                        return;
+                    } else {
+                        fallback_active = false;
+                        continue;
+                    }
+                }
                 Some(f) = prio_rx.recv() => f,
                 Some(f) = data_rx.recv() => f,
                 else => break,
@@ -167,7 +184,7 @@ impl Session {
                     combined.extend_from_slice(&payload);
 
                     if writer.write_all(&combined).await.is_err() {
-                        return; // 遇到严重网络错误直接退出，交由 Pool 销毁重连
+                        return;
                     }
                 } else {
                     if writer.write_all(&header_bytes).await.is_err() {
@@ -176,8 +193,6 @@ impl Session {
                 }
 
                 batched += 1;
-                // 核心修复：最大允许连续写入 64 帧，随后必须强行跳出循环进行 flush
-                // 防止在高并发下载时陷入无尽的 try_recv() 饿死 TLS 引擎和协程调度器
                 if batched >= 64 {
                     break;
                 }
@@ -191,7 +206,6 @@ impl Session {
                 };
             }
 
-            // 将所有积压的数据推送到真实的 TCP 底层
             if writer.flush().await.is_err() {
                 break;
             }
@@ -205,6 +219,7 @@ impl Session {
         data_tx: mpsc::UnboundedSender<Frame>,
         accept_tx: mpsc::Sender<Stream>,
         config: Config,
+        mut fallback_tx: Option<mpsc::Sender<tokio::net::tcp::OwnedReadHalf>>,
     ) where
         R: AsyncRead + Unpin,
     {
@@ -219,6 +234,19 @@ impl Session {
             let (cmd, flags, length, stream_id) = match Frame::decode_header(&header_buf) {
                 Ok(h) => h,
                 Err(_) => {
+                    // 解码失败：绝大部分主动探测器发的 HTTP 请求过不了这个头部校验，直接拉起回落
+                    if let Some(tx) = fallback_tx.take() {
+                        if !config.is_client && !config.fallback_target.is_empty() {
+                            if let Ok(target_stream) =
+                                tokio::net::TcpStream::connect(&config.fallback_target).await
+                            {
+                                let (target_rh, mut target_wh) = target_stream.into_split();
+                                let _ = tx.try_send(target_rh); // 移交读半部给 write_loop
+                                let _ = target_wh.write_all(&header_buf).await; // 吐出吃掉的 8 字节 HTTP 请求头
+                                let _ = tokio::io::copy(reader, &mut target_wh).await;
+                            }
+                        }
+                    }
                     break;
                 }
             };
@@ -233,20 +261,49 @@ impl Session {
                 None
             };
 
-            if !auth_passed && stream_id == 0 && cmd == CMD_CTRL && (flags & FLAG_SYN != 0) {
-                if let Some(ref p) = payload {
-                    if p.len() >= 32 {
-                        let mut hasher = Sha256::new();
-                        hasher.update(config.password.as_bytes());
-                        let expected_hash = hasher.finalize();
+            // 如果处于未验证状态（初次连接），严防死守所有非授权帧
+            if !auth_passed {
+                if cmd == CMD_WASTE {
+                    continue; // L5 流量整形的伪装帧，正常放行
+                }
 
-                        if p[..32] == expected_hash[..] {
-                            auth_passed = true;
-                            continue;
+                let mut matched = false;
+                if stream_id == 0 && cmd == CMD_CTRL && (flags & FLAG_SYN != 0) {
+                    if let Some(ref p) = payload {
+                        if p.len() >= 32 {
+                            let mut hasher = Sha256::new();
+                            hasher.update(config.password.as_bytes());
+                            let expected_hash = hasher.finalize();
+
+                            if p[..32] == expected_hash[..] {
+                                matched = true;
+                            }
                         }
                     }
                 }
-                break;
+
+                if matched {
+                    auth_passed = true;
+                    continue; // 密码正确，开始正常接管 NeoProxy 流量
+                } else {
+                    // 密码错误 或 收到了非授权帧 (如直接发来 CMD_DATA)，按重放攻击或扫描器处理，拉起回落
+                    if let Some(tx) = fallback_tx.take() {
+                        if !config.is_client && !config.fallback_target.is_empty() {
+                            if let Ok(target_stream) =
+                                tokio::net::TcpStream::connect(&config.fallback_target).await
+                            {
+                                let (target_rh, mut target_wh) = target_stream.into_split();
+                                let _ = tx.try_send(target_rh);
+                                let _ = target_wh.write_all(&header_buf).await;
+                                if let Some(ref p) = payload {
+                                    let _ = target_wh.write_all(p).await;
+                                }
+                                let _ = tokio::io::copy(reader, &mut target_wh).await;
+                            }
+                        }
+                    }
+                    break;
+                }
             }
 
             if cmd == CMD_WASTE {
