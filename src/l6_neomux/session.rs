@@ -4,16 +4,15 @@ use super::frame::{
     FLAG_RST, FLAG_SYN, HEADER_SIZE,
 };
 use super::stream::{Stream, StreamInternal};
-use bytes::BytesMut; // 移除了未使用的 Bytes
+use bytes::BytesMut;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{self, IoSlice};
+use std::io::{self};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-/// 存放在 Arc 中被并发安全访问的全局会话状态
 pub(crate) struct SessionState {
     pub streams: std::sync::Mutex<HashMap<u32, Arc<StreamInternal>>>,
     pub global_send_window: AtomicI32,
@@ -33,18 +32,16 @@ pub struct Session {
     state: Arc<SessionState>,
     next_stream_id: AtomicU32,
     prio_tx: mpsc::UnboundedSender<Frame>,
-    data_tx: mpsc::UnboundedSender<Frame>, // 修改为无界通道
+    data_tx: mpsc::UnboundedSender<Frame>,
     accept_rx: AsyncMutex<mpsc::Receiver<Stream>>,
 }
 
 impl Session {
-    /// 挂载并启动会话，移除了不需要的 mut conn
     pub async fn new<T>(conn: T, config: Config) -> io::Result<Arc<Self>>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (prio_tx, prio_rx) = mpsc::unbounded_channel();
-        // 改为无界通道：依靠严密的 Window 配额控制背压，避免死锁
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::channel(128);
 
@@ -64,7 +61,6 @@ impl Session {
             accept_rx: AsyncMutex::new(accept_rx),
         });
 
-        // 客户端: 启动首包鉴权 (Standard TLS 防主动探测核心)
         if config.is_client && config.require_auth {
             let mut hasher = Sha256::new();
             hasher.update(config.password.as_bytes());
@@ -145,7 +141,7 @@ impl Session {
     async fn write_loop<W>(
         writer: &mut W,
         mut prio_rx: mpsc::UnboundedReceiver<Frame>,
-        mut data_rx: mpsc::UnboundedReceiver<Frame>, // 修改为 UnboundedReceiver
+        mut data_rx: mpsc::UnboundedReceiver<Frame>,
     ) where
         W: AsyncWrite + Unpin,
     {
@@ -161,9 +157,13 @@ impl Session {
             frame.encode_header(&mut header_buf);
             let header_bytes = header_buf.freeze();
 
+            // 修复：抛弃有缺陷的 write_vectored，改为手动拼接后 write_all
             if let Some(payload) = frame.payload {
-                let bufs = &mut [IoSlice::new(&header_bytes), IoSlice::new(&payload)];
-                if writer.write_vectored(bufs).await.is_err() {
+                let mut combined = BytesMut::with_capacity(header_bytes.len() + payload.len());
+                combined.extend_from_slice(&header_bytes);
+                combined.extend_from_slice(&payload);
+
+                if writer.write_all(&combined).await.is_err() {
                     break;
                 }
             } else {
@@ -178,7 +178,7 @@ impl Session {
         reader: &mut R,
         state: Arc<SessionState>,
         prio_tx: mpsc::UnboundedSender<Frame>,
-        data_tx: mpsc::UnboundedSender<Frame>, // 修改为 UnboundedSender
+        data_tx: mpsc::UnboundedSender<Frame>,
         accept_tx: mpsc::Sender<Stream>,
         config: Config,
     ) where

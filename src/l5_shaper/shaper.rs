@@ -40,7 +40,11 @@ impl<T> ShaperStream<T> {
         if target_len < 8 {
             target_len = 8;
         }
-        let payload_len = target_len - 8;
+        // 修复：防 u16 溢出截断
+        let mut payload_len = target_len - 8;
+        if payload_len > 65535 {
+            payload_len = 65535;
+        }
 
         self.write_buf.put_u8(0x14);
         self.write_buf.put_u8(0x00);
@@ -49,7 +53,6 @@ impl<T> ShaperStream<T> {
         self.write_buf.put_slice(&get_waste_pool()[..payload_len]);
     }
 
-    // 修复了未使用 mut 的警告
     fn write_fixed(&mut self, data: &[u8], target_len: usize) {
         let padding = target_len.saturating_sub(data.len());
         if padding == 0 {
@@ -58,7 +61,11 @@ impl<T> ShaperStream<T> {
         }
 
         let padding = if padding < 8 { 8 } else { padding };
-        let payload_len = padding - 8;
+        // 修复：防 u16 溢出截断
+        let mut payload_len = padding - 8;
+        if payload_len > 65535 {
+            payload_len = 65535;
+        }
 
         self.write_buf.put_slice(data);
         self.write_buf.put_u8(0x14);
@@ -75,7 +82,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for ShaperStream<T> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut(); // 解除 Pin 限制，允许字段分离借用
+        let this = self.get_mut();
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
@@ -86,18 +93,19 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ShaperStream<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        let this = self.get_mut(); // 获取普通的可变引用，避免借用冲突
+        let this = self.get_mut();
 
         if this.iter.is_none() {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
 
-        if !this.write_buf.is_empty() {
+        // 修复 1：使用 while 循环榨干遗留缓冲区，彻底修复 Waker 唤醒丢失问题
+        while !this.write_buf.is_empty() {
             let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.write_buf))?;
-            this.write_buf.advance(n);
-            if !this.write_buf.is_empty() {
-                return Poll::Pending;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")));
             }
+            this.write_buf.advance(n);
         }
 
         let mut consumed_from_buf = 0;
@@ -129,13 +137,21 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ShaperStream<T> {
             }
         }
 
-        if !this.write_buf.is_empty() {
+        // 修复 2：刚塞入新数据后，再次用 while 循环写出
+        while !this.write_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.write_buf.advance(n);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
+                    // 若底层真写不动了 (Pending)，且消费了用户数据，就通知上层
                     if consumed_from_buf > 0 {
                         return Poll::Ready(Ok(consumed_from_buf));
                     }
@@ -147,6 +163,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ShaperStream<T> {
         if consumed_from_buf > 0 {
             Poll::Ready(Ok(consumed_from_buf))
         } else {
+            // 本轮如果都是注入(Inject)，并没有消费用户 payload，需主动唤醒自己进行下一轮
             cx.waker().wake_by_ref();
             Poll::Pending
         }
@@ -154,12 +171,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ShaperStream<T> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         let this = self.get_mut();
-        if !this.write_buf.is_empty() {
+        // 修复：flush 也必须循环榨干
+        while !this.write_buf.is_empty() {
             let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.write_buf))?;
-            this.write_buf.advance(n);
-            if !this.write_buf.is_empty() {
-                return Poll::Pending;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")));
             }
+            this.write_buf.advance(n);
         }
         Pin::new(&mut this.inner).poll_flush(cx)
     }

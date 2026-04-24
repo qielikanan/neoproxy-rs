@@ -1,4 +1,3 @@
-// 移除了未使用的 ATYP_DOMAIN
 use super::address::{Address, ATYP_IPV4, ATYP_IPV6, UDP_OVER_TCP_DOMAIN};
 use crate::l6_neomux::Stream;
 use bytes::{BufMut, BytesMut};
@@ -8,7 +7,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 pub async fn handle_stream(mut stream: Stream) {
-    // 1. 读取并解析客户端想访问的真实目标地址
     let addr = match Address::decode(&mut stream).await {
         Ok(a) => a,
         Err(e) => {
@@ -17,7 +15,6 @@ pub async fn handle_stream(mut stream: Stream) {
         }
     };
 
-    // ⚡️ 拦截 UDP 隧道请求
     if let Address::Domain(ref name, _) = addr {
         if name == UDP_OVER_TCP_DOMAIN {
             tracing::info!("[L7 服务端] 收到 UDP 隧道代理请求，启动虚拟 Socket 通道");
@@ -32,8 +29,6 @@ pub async fn handle_stream(mut stream: Stream) {
         target_str
     );
 
-    // 2. 拨号连接到真实目标 (例如 google.com:443)
-    // 移除了 target_conn 前面多余的 mut
     let target_conn = match TcpStream::connect(&target_str).await {
         Ok(c) => c,
         Err(e) => {
@@ -42,14 +37,23 @@ pub async fn handle_stream(mut stream: Stream) {
         }
     };
 
-    // 3. 建立双向零拷贝透传
     let (mut ri, mut wi) = tokio::io::split(stream);
     let (mut ro, mut wo) = tokio::io::split(target_conn);
 
-    let _ = tokio::try_join!(
-        tokio::io::copy(&mut ri, &mut wo),
-        tokio::io::copy(&mut ro, &mut wi)
-    );
+    // 修复：添加优雅半关闭 (Half-Close)，防止目标服务器挂起卡死
+    let client_to_target = async {
+        let _ = tokio::io::copy(&mut ri, &mut wo).await;
+        let _ = wo.shutdown().await;
+        Ok::<(), std::io::Error>(())
+    };
+
+    let target_to_client = async {
+        let _ = tokio::io::copy(&mut ro, &mut wi).await;
+        let _ = wi.shutdown().await;
+        Ok::<(), std::io::Error>(())
+    };
+
+    let _ = tokio::try_join!(client_to_target, target_to_client);
 }
 
 // ============================================================================
@@ -57,7 +61,6 @@ pub async fn handle_stream(mut stream: Stream) {
 // ============================================================================
 
 async fn handle_udp_stream(stream: Stream) {
-    // 为该隧道分配独立的 UDP Socket 与公网交互
     let udp_socket = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => Arc::new(s),
         Err(_) => return,
@@ -66,7 +69,6 @@ async fn handle_udp_stream(stream: Stream) {
     let (mut stream_r, mut stream_w) = tokio::io::split(stream);
     let udp_out = udp_socket.clone();
 
-    // 协程 A: Stream -> 公网 UDP 目标
     let up_task = tokio::spawn(async move {
         loop {
             let len = match stream_r.read_u16().await {
@@ -82,14 +84,12 @@ async fn handle_udp_stream(stream: Stream) {
                 break;
             }
 
-            // 浏览器传来的包裹自带 SOCKS5 UDP 头，我们需要从中解析出真实目标
             if let Ok((target_addr, offset)) = parse_socks5_udp_header(&payload) {
                 let _ = udp_out.send_to(&payload[offset..], target_addr).await;
             }
         }
     });
 
-    // 协程 B: 公网 UDP 目标 -> Stream
     let down_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -98,7 +98,6 @@ async fn handle_udp_stream(stream: Stream) {
                 Err(_) => break,
             };
 
-            // 将来自公网的真实 IP 包装成 SOCKS5 UDP 头塞回去
             let header = build_socks5_udp_header(source_addr);
             let total_len = header.len() + n;
 
