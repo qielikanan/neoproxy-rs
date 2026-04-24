@@ -87,13 +87,31 @@ async fn do_fallback(stream: TlsStream<tokio::net::TcpStream>, dest: String) {
         let (mut ri, mut wi) = tokio::io::split(stream);
         let (mut ro, mut wo) = tokio::io::split(target);
         let _ = tokio::try_join!(
+            // 浏览器到 Nginx 的方向 (通常是客户端主动发包，普通 copy 即可)
             async {
                 let _ = tokio::io::copy(&mut ri, &mut wo).await;
                 let _ = wo.shutdown().await;
                 Ok::<(), io::Error>(())
             },
             async {
-                let _ = tokio::io::copy(&mut ro, &mut wi).await;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut ro, &mut buf).await {
+                        Ok(0) => break, // Nginx 断开连接
+                        Ok(n) => {
+                            if tokio::io::AsyncWriteExt::write_all(&mut wi, &buf[..n])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if tokio::io::AsyncWriteExt::flush(&mut wi).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let _ = wi.shutdown().await;
                 Ok::<(), io::Error>(())
             }
