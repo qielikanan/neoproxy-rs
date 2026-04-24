@@ -302,9 +302,9 @@ impl Session {
                     break;
                 }
 
-                let frame_data = read_buf.split_to(total_len);
+                let frame_data = read_buf.split_to(total_len).freeze();
                 let payload = if length > 0 {
-                    Some(frame_data.freeze().slice(HEADER_SIZE..))
+                    Some(frame_data.slice(HEADER_SIZE..))
                 } else {
                     None
                 };
@@ -352,21 +352,10 @@ impl Session {
                                 {
                                     let (target_rh, mut target_wh) = target_stream.into_split();
                                     let _ = tx.try_send(target_rh);
-                                    let mut h_buf = [0u8; HEADER_SIZE];
-                                    let f = Frame {
-                                        cmd,
-                                        flags,
-                                        length,
-                                        stream_id,
-                                        payload: None,
-                                    };
-                                    f.encode_header_to_slice(&mut h_buf);
-                                    let _ = target_wh.write_all(&h_buf).await;
-                                    if let Some(ref p) = payload {
-                                        let _ = target_wh.write_all(p).await;
-                                    }
+                                    let _ = target_wh.write_all(&frame_data).await;
                                     let _ = target_wh.write_all(&read_buf).await;
                                     let _ = tokio::io::copy(reader, &mut target_wh).await;
+                                    let _ = target_wh.shutdown().await;
                                 }
                             }
                         }
