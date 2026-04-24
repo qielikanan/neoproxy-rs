@@ -324,7 +324,18 @@ impl Session {
                                 let is_match: subtle::Choice = p[..32].ct_eq(&expected_hash[..32]);
                                 if is_match.unwrap_u8() == 1 {
                                     matched = true;
+                                    tracing::info!(
+                                        "🔒 [Security] 首包哈希鉴权成功，建立 NeoMux 会话。"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "⚠️ [Security] 收到非法连接，哈希鉴权失败，触发伪装回落机制。"
+                                    );
                                 }
+                            } else {
+                                tracing::warn!(
+                                    "⚠️ [Security] 收到畸形首包，长度不足以进行哈希校验。"
+                                );
                             }
                         }
                     }
