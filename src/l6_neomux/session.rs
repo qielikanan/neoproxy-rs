@@ -5,8 +5,8 @@ use super::frame::{
 };
 use super::stream::{Stream, StreamInternal};
 use bytes::BytesMut;
+use clashmap::ClashMap;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::io::{self};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -15,16 +15,62 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub(crate) struct SessionState {
-    pub streams: std::sync::Mutex<HashMap<u32, Arc<StreamInternal>>>,
+    pub streams: ClashMap<u32, Arc<StreamInternal>>,
     pub global_send_window: AtomicI32,
     pub stream_count: AtomicU32,
 }
 
 impl SessionState {
+    pub fn new() -> Self {
+        Self {
+            streams: ClashMap::new(),
+            global_send_window: AtomicI32::new(10 * 1024 * 1024), // 10MB
+            stream_count: AtomicU32::new(0),
+        }
+    }
+
+    pub fn insert_stream(&self, stream_id: u32, stream: Arc<StreamInternal>) {
+        self.streams.insert(stream_id, stream);
+        self.stream_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn remove_stream(&self, stream_id: u32) {
-        let mut streams = self.streams.lock().unwrap();
-        if streams.remove(&stream_id).is_some() {
+        if self.streams.remove(&stream_id).is_some() {
             self.stream_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get_stream(&self, stream_id: u32) -> Option<Arc<StreamInternal>> {
+        // clashmap 的 get 返回一个 Ref，我们需要 clone 出内部的 Arc
+        self.streams
+            .get(&stream_id)
+            .map(|ref_kv| ref_kv.value().clone())
+    }
+
+    pub fn wake_all_tx(&self) {
+        let streams_to_wake: Vec<Arc<StreamInternal>> = self
+            .streams
+            .iter()
+            .map(|ref_kv| ref_kv.value().clone())
+            .collect();
+
+        for s in streams_to_wake {
+            s.wake_tx();
+        }
+    }
+
+    pub fn reset_all_streams(&self) {
+        let streams_to_reset: Vec<Arc<StreamInternal>> = self
+            .streams
+            .iter()
+            .map(|ref_kv| ref_kv.value().clone())
+            .collect();
+
+        self.streams.clear();
+        self.stream_count.store(0, Ordering::Release);
+
+        for s in streams_to_reset {
+            s.handle_rst();
         }
     }
 }
@@ -49,11 +95,7 @@ impl Session {
         // 跨协程传递 Fallback 通道的利器
         let (fallback_tx, fallback_rx) = mpsc::channel::<tokio::net::tcp::OwnedReadHalf>(1);
 
-        let state = Arc::new(SessionState {
-            streams: std::sync::Mutex::new(HashMap::new()),
-            global_send_window: AtomicI32::new(10 * 1024 * 1024), // 10MB
-            stream_count: AtomicU32::new(0),
-        });
+        let state = Arc::new(SessionState::new());
 
         let next_stream_id = if config.is_client { 1 } else { 2 };
 
@@ -126,11 +168,7 @@ impl Session {
             self.state.clone(),
         ));
 
-        {
-            let mut streams = self.state.streams.lock().unwrap();
-            streams.insert(stream_id, internal.clone());
-        }
-        self.state.stream_count.fetch_add(1, Ordering::Relaxed);
+        self.state.insert_stream(stream_id, internal.clone());
 
         let _ = self.prio_tx.send(Frame {
             cmd: CMD_CTRL,
@@ -156,19 +194,16 @@ impl Session {
         loop {
             let frame = tokio::select! {
                 biased;
-                // [机制核心]：如果收到 Fallback 的信号，中断多路复用写逻辑，化身纯粹的数据管道
                 opt_rh = fallback_rx.recv(), if fallback_active => {
                     if let Some(mut target_rh) = opt_rh {
-                        // 废弃 tokio::io::copy，改用自定义的 flushable 转发循环
                         let mut buf = [0u8; 8192];
                         loop {
                             match tokio::io::AsyncReadExt::read(&mut target_rh, &mut buf).await {
-                                Ok(0) => break, // Nginx 断开了连接 (EOF)
+                                Ok(0) => break,
                                 Ok(n) => {
                                     if tokio::io::AsyncWriteExt::write_all(writer, &buf[..n]).await.is_err() {
                                         break;
                                     }
-                                    // 【关键修复】：强制要求 TLS 层组装 Record 并发往 TCP 网卡
                                     if tokio::io::AsyncWriteExt::flush(writer).await.is_err() {
                                         break;
                                     }
@@ -176,7 +211,6 @@ impl Session {
                                 Err(_) => break,
                             }
                         }
-                        // 【关键修复】：确保发送 TLS CloseNotify 并优雅关闭连接
                         let _ = tokio::io::AsyncWriteExt::shutdown(writer).await;
                         return;
                     } else {
@@ -253,15 +287,14 @@ impl Session {
             let (cmd, flags, length, stream_id) = match Frame::decode_header(&header_buf) {
                 Ok(h) => h,
                 Err(_) => {
-                    // 解码失败：绝大部分主动探测器发的 HTTP 请求过不了这个头部校验，直接拉起回落
                     if let Some(tx) = fallback_tx.take() {
                         if !config.is_client && !config.fallback_target.is_empty() {
                             if let Ok(target_stream) =
                                 tokio::net::TcpStream::connect(&config.fallback_target).await
                             {
                                 let (target_rh, mut target_wh) = target_stream.into_split();
-                                let _ = tx.try_send(target_rh); // 移交读半部给 write_loop
-                                let _ = target_wh.write_all(&header_buf).await; // 吐出吃掉的 8 字节 HTTP 请求头
+                                let _ = tx.try_send(target_rh);
+                                let _ = target_wh.write_all(&header_buf).await;
                                 let _ = tokio::io::copy(reader, &mut target_wh).await;
                                 let _ = target_wh.shutdown().await;
                             }
@@ -281,10 +314,9 @@ impl Session {
                 None
             };
 
-            // 如果处于未验证状态（初次连接），严防死守所有非授权帧
             if !auth_passed {
                 if cmd == CMD_WASTE {
-                    continue; // L5 流量整形的伪装帧，正常放行
+                    continue;
                 }
 
                 let mut matched = false;
@@ -295,10 +327,7 @@ impl Session {
                             hasher.update(config.password.as_bytes());
                             let expected_hash = hasher.finalize();
 
-                            let client_hash = &p[..32];
-                            let server_hash = &expected_hash[..32];
-
-                            let is_match = client_hash.ct_eq(server_hash);
+                            let is_match: subtle::Choice = p[..32].ct_eq(&expected_hash[..32]);
 
                             if is_match.unwrap_u8() == 1 {
                                 matched = true;
@@ -318,9 +347,8 @@ impl Session {
 
                 if matched {
                     auth_passed = true;
-                    continue; // 密码正确，开始正常接管 NeoProxy 流量
+                    continue;
                 } else {
-                    // 密码错误 或 收到了非授权帧 (如直接发来 CMD_DATA)，按重放攻击或扫描器处理，拉起回落
                     if let Some(tx) = fallback_tx.take() {
                         if !config.is_client && !config.fallback_target.is_empty() {
                             if let Ok(target_stream) =
@@ -351,10 +379,8 @@ impl Session {
                         if p.len() >= 4 {
                             let delta = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as i32;
                             state.global_send_window.fetch_add(delta, Ordering::Relaxed);
-                            let streams = state.streams.lock().unwrap();
-                            for s in streams.values() {
-                                s.wake_tx();
-                            }
+                            // 优雅地无锁批量唤醒
+                            state.wake_all_tx();
                         }
                     }
                 } else if cmd == CMD_PING && (flags & FLAG_ACK == 0) {
@@ -372,7 +398,6 @@ impl Session {
             let is_syn = (flags & FLAG_SYN) != 0;
 
             let stream_opt = {
-                let mut streams = state.streams.lock().unwrap();
                 if is_syn {
                     if state.stream_count.load(Ordering::Relaxed) < config.max_stream_count {
                         let internal = Arc::new(StreamInternal::new(
@@ -381,8 +406,7 @@ impl Session {
                             data_tx.clone(),
                             state.clone(),
                         ));
-                        streams.insert(stream_id, internal.clone());
-                        state.stream_count.fetch_add(1, Ordering::Relaxed);
+                        state.insert_stream(stream_id, internal.clone());
 
                         let stream = Stream {
                             internal: internal.clone(),
@@ -407,7 +431,7 @@ impl Session {
                         None
                     }
                 } else {
-                    streams.get(&stream_id).cloned()
+                    state.get_stream(stream_id)
                 }
             };
 
@@ -436,12 +460,6 @@ impl Session {
             }
         }
 
-        let streams = {
-            let mut map = state.streams.lock().unwrap();
-            std::mem::take(&mut *map)
-        };
-        for (_, s) in streams {
-            s.handle_rst();
-        }
+        state.reset_all_streams();
     }
 }

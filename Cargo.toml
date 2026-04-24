@@ -30,3 +30,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 rcgen = "0.14.7"
 subtle = "2.6"
+clashmap = "1.2"
