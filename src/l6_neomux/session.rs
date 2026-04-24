@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{self};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
@@ -294,9 +295,23 @@ impl Session {
                             hasher.update(config.password.as_bytes());
                             let expected_hash = hasher.finalize();
 
-                            if p[..32] == expected_hash[..] {
+                            let client_hash = &p[..32];
+                            let server_hash = &expected_hash[..32];
+
+                            let is_match = client_hash.ct_eq(server_hash);
+
+                            if is_match.unwrap_u8() == 1 {
                                 matched = true;
+                                tracing::info!(
+                                    "🔒 [Security] 首包哈希鉴权成功，建立 NeoMux 会话。"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "⚠️ [Security] 收到非法连接，哈希鉴权失败，触发伪装回落机制。"
+                                );
                             }
+                        } else {
+                            tracing::warn!("⚠️ [Security] 收到畸形首包，长度不足以进行哈希校验。");
                         }
                     }
                 }
