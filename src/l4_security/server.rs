@@ -33,11 +33,12 @@ pub fn build_tls_acceptor_jls<P: AsRef<Path>>(
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
     let jls_cfg = JlsServerConfig::new(iv.into(), pwd.into(), None, None);
     config.jls_config = jls_cfg.into();
     Ok(Arc::new(config))
 }
-
 pub fn build_tls_acceptor_generated(domain: &str) -> io::Result<Arc<ServerConfig>> {
     let (certs, key) = generate_dummy_cert(domain)?;
     let config = ServerConfig::builder()
