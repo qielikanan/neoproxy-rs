@@ -247,6 +247,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<T> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        let _ = std::io::Write::flush(&mut this.conn.writer());
+
         let mut sync_io = SyncIo {
             io: &mut this.io,
             cx: &mut *cx,
