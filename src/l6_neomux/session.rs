@@ -158,7 +158,25 @@ impl Session {
                 // [机制核心]：如果收到 Fallback 的信号，中断多路复用写逻辑，化身纯粹的数据管道
                 opt_rh = fallback_rx.recv(), if fallback_active => {
                     if let Some(mut target_rh) = opt_rh {
-                        let _ = tokio::io::copy(&mut target_rh, writer).await;
+                        // 废弃 tokio::io::copy，改用自定义的 flushable 转发循环
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match tokio::io::AsyncReadExt::read(&mut target_rh, &mut buf).await {
+                                Ok(0) => break, // Nginx 断开了连接 (EOF)
+                                Ok(n) => {
+                                    if tokio::io::AsyncWriteExt::write_all(writer, &buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                    // 【关键修复】：强制要求 TLS 层组装 Record 并发往 TCP 网卡
+                                    if tokio::io::AsyncWriteExt::flush(writer).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        // 【关键修复】：确保发送 TLS CloseNotify 并优雅关闭连接
+                        let _ = tokio::io::AsyncWriteExt::shutdown(writer).await;
                         return;
                     } else {
                         fallback_active = false;
@@ -244,6 +262,7 @@ impl Session {
                                 let _ = tx.try_send(target_rh); // 移交读半部给 write_loop
                                 let _ = target_wh.write_all(&header_buf).await; // 吐出吃掉的 8 字节 HTTP 请求头
                                 let _ = tokio::io::copy(reader, &mut target_wh).await;
+                                let _ = target_wh.shutdown().await;
                             }
                         }
                     }
@@ -299,6 +318,7 @@ impl Session {
                                     let _ = target_wh.write_all(p).await;
                                 }
                                 let _ = tokio::io::copy(reader, &mut target_wh).await;
+                                let _ = target_wh.shutdown().await;
                             }
                         }
                     }
