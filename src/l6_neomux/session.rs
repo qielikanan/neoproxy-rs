@@ -153,23 +153,47 @@ impl Session {
                 else => break,
             };
 
-            let mut header_buf = BytesMut::with_capacity(HEADER_SIZE);
-            frame.encode_header(&mut header_buf);
-            let header_bytes = header_buf.freeze();
+            let mut batched = 0;
+            let mut current_frame = Some(frame);
 
-            // 修复：抛弃有缺陷的 write_vectored，改为手动拼接后 write_all
-            if let Some(payload) = frame.payload {
-                let mut combined = BytesMut::with_capacity(header_bytes.len() + payload.len());
-                combined.extend_from_slice(&header_bytes);
-                combined.extend_from_slice(&payload);
+            while let Some(f) = current_frame {
+                let mut header_buf = BytesMut::with_capacity(HEADER_SIZE);
+                f.encode_header(&mut header_buf);
+                let header_bytes = header_buf.freeze();
 
-                if writer.write_all(&combined).await.is_err() {
+                if let Some(payload) = f.payload {
+                    let mut combined = BytesMut::with_capacity(header_bytes.len() + payload.len());
+                    combined.extend_from_slice(&header_bytes);
+                    combined.extend_from_slice(&payload);
+
+                    if writer.write_all(&combined).await.is_err() {
+                        return; // 遇到严重网络错误直接退出，交由 Pool 销毁重连
+                    }
+                } else {
+                    if writer.write_all(&header_bytes).await.is_err() {
+                        return;
+                    }
+                }
+
+                batched += 1;
+                // 核心修复：最大允许连续写入 64 帧，随后必须强行跳出循环进行 flush
+                // 防止在高并发下载时陷入无尽的 try_recv() 饿死 TLS 引擎和协程调度器
+                if batched >= 64 {
                     break;
                 }
-            } else {
-                if writer.write_all(&header_bytes).await.is_err() {
-                    break;
-                }
+
+                current_frame = match prio_rx.try_recv() {
+                    Ok(f) => Some(f),
+                    Err(_) => match data_rx.try_recv() {
+                        Ok(f) => Some(f),
+                        Err(_) => None,
+                    },
+                };
+            }
+
+            // 将所有积压的数据推送到真实的 TCP 底层
+            if writer.flush().await.is_err() {
+                break;
             }
         }
     }
@@ -195,9 +219,6 @@ impl Session {
             let (cmd, flags, length, stream_id) = match Frame::decode_header(&header_buf) {
                 Ok(h) => h,
                 Err(_) => {
-                    if !auth_passed && !config.is_client {
-                        // TODO: 将连接移交给 FallbackTarget
-                    }
                     break;
                 }
             };
