@@ -30,7 +30,10 @@ pub async fn handle_stream(mut stream: Stream) {
     );
 
     let target_conn = match TcpStream::connect(&target_str).await {
-        Ok(c) => c,
+        Ok(c) => {
+            tracing::info!("✅ [L7 服务端] 成功连上目标网站: {}", target_str);
+            c
+        }
         Err(e) => {
             tracing::warn!("[L7 服务端] 无法连接到目标 {}: {:?}", target_str, e);
             return;
