@@ -39,6 +39,15 @@ impl Frame {
         buf.put_u32(self.stream_id);
     }
 
+    pub fn encode_header_to_slice(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= HEADER_SIZE);
+        let ver_cmd = (VERSION << 4) | (self.cmd & 0x0F);
+        buf[0] = ver_cmd;
+        buf[1] = self.flags;
+        buf[2..4].copy_from_slice(&self.length.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.stream_id.to_be_bytes());
+    }
+
     /// 解析 8 字节二进制头
     pub fn decode_header(header: &[u8]) -> io::Result<(u8, u8, u16, u32)> {
         if header.len() < HEADER_SIZE {

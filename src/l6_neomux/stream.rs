@@ -7,7 +7,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 pub(crate) struct StreamState {
     pub rx_queue: VecDeque<Bytes>,
     pub rx_offset: usize,
+
+    // 高性能改进：有界本地写出缓冲，配合 Session 的 Pull 拉模式避免 OOM
+    pub tx_queue: VecDeque<Frame>,
 
     pub rx_waker: Option<Waker>,
     pub tx_waker: Option<Waker>,
@@ -31,26 +34,24 @@ pub(crate) struct StreamState {
 pub(crate) struct StreamInternal {
     pub id: u32,
     pub prio_tx: mpsc::UnboundedSender<Frame>,
-    pub data_tx: mpsc::UnboundedSender<Frame>, // 修改为无界通道
     pub session_state: Arc<SessionState>,
-    pub state: std::sync::Mutex<StreamState>,
+    pub state: Mutex<StreamState>,
 }
 
 impl StreamInternal {
     pub fn new(
         id: u32,
         prio_tx: mpsc::UnboundedSender<Frame>,
-        data_tx: mpsc::UnboundedSender<Frame>, // 修改为无界通道
         session_state: Arc<SessionState>,
     ) -> Self {
         Self {
             id,
             prio_tx,
-            data_tx,
             session_state,
-            state: std::sync::Mutex::new(StreamState {
+            state: Mutex::new(StreamState {
                 rx_queue: VecDeque::new(),
                 rx_offset: 0,
+                tx_queue: VecDeque::with_capacity(64),
                 rx_waker: None,
                 tx_waker: None,
                 send_window: INITIAL_WINDOW_SIZE,
@@ -65,13 +66,6 @@ impl StreamInternal {
 
     pub fn wake_rx(&self, state: &mut StreamState) {
         if let Some(waker) = state.rx_waker.take() {
-            waker.wake();
-        }
-    }
-
-    pub fn wake_tx(&self) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(waker) = state.tx_waker.take() {
             waker.wake();
         }
     }
@@ -166,7 +160,6 @@ impl AsyncRead for Stream {
             )));
         }
 
-        // 魔法修正点：克隆出零拷贝引用，立刻结束借用冲突
         let front_opt = state.rx_queue.front().cloned();
 
         if let Some(front) = front_opt {
@@ -229,6 +222,12 @@ impl AsyncWrite for Stream {
             )));
         }
 
+        // 严格的内存控制：如果缓冲区积压帧过多，强行阻塞该流写入，杜绝 OOM
+        if state.tx_queue.len() >= 64 {
+            state.tx_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
         let global_win = self
             .internal
             .session_state
@@ -236,6 +235,15 @@ impl AsyncWrite for Stream {
             .load(Ordering::Acquire);
 
         if state.send_window <= 0 || global_win <= 0 {
+            if global_win <= 0 {
+                // 注册到精准唤醒队列，而非全部唤醒
+                self.internal
+                    .session_state
+                    .global_tx_wakers
+                    .lock()
+                    .unwrap()
+                    .push(cx.waker().clone());
+            }
             state.tx_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
@@ -252,14 +260,25 @@ impl AsyncWrite for Stream {
 
         let payload = Bytes::copy_from_slice(&buf[..can_send]);
 
-        // 直接通过无界通道发送，移除了原本引发报错的 poll_ready 阻塞逻辑
-        let _ = self.internal.data_tx.send(Frame {
+        // 推入本地队列，并使用轻量级 Notify 告知 Session 来提取
+        state.tx_queue.push_back(Frame {
             cmd: CMD_DATA,
             flags: 0,
             length: can_send as u16,
             stream_id: self.internal.id,
             payload: Some(payload),
         });
+
+        // 仅在释放内部锁后执行外部同步结构以防止潜在死锁
+        drop(state);
+
+        self.internal
+            .session_state
+            .ready_streams
+            .lock()
+            .unwrap()
+            .push_back(self.internal.id);
+        self.internal.session_state.write_notify.notify_one();
 
         Poll::Ready(Ok(can_send))
     }
