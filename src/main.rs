@@ -35,6 +35,7 @@ struct AppConfig {
     pub key: Option<String>,
     pub password: Option<String>,
     pub jls_iv: Option<String>,
+    pub pinnedhash: Option<String>,
     #[serde(default = "default_padding")]
     pub padding: String,
 }
@@ -227,11 +228,12 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
         .unwrap_or_else(|| "3070111071563328618171495819203123318".to_string());
     let security_mode = app_cfg.security.clone();
     let padding_script = app_cfg.padding.clone();
+    let pinnedhash = app_cfg.pinnedhash.clone();
 
     let tls_config = if security_mode == "jls" {
         build_tls_connector_jls(&iv, &password)
     } else {
-        build_tls_connector()
+        build_tls_connector(pinnedhash.as_deref())
     };
 
     let dial_func: l7_router::session_pool::DialFunc = Arc::new(move || {

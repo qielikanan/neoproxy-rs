@@ -3,40 +3,66 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::jls::JlsClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
 #[derive(Debug)]
-struct NoCertificateVerification;
+struct PinnedVerifier {
+    expected_hash: String,
+}
 
-impl ServerCertVerifier for NoCertificateVerification {
+impl ServerCertVerifier for PinnedVerifier {
     fn verify_server_cert(
         &self,
-        _e: &CertificateDer<'_>,
-        _i: &[CertificateDer<'_>],
-        _s: &ServerName<'_>,
-        _o: &[u8],
-        _n: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        Ok(ServerCertVerified::assertion())
+        let mut hasher = Sha256::new();
+        hasher.update(end_entity.as_ref());
+        let hash = hasher.finalize();
+        let hash_str = hash
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        if hash_str.eq_ignore_ascii_case(&self.expected_hash) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            tracing::warn!(
+                "⚠️ 证书固定校验失败！期待: {}, 实际收到: {}",
+                self.expected_hash,
+                hash_str
+            );
+            Err(RustlsError::General(format!(
+                "certificate pinning verification failed! Expected {}, got {}",
+                self.expected_hash, hash_str
+            )))
+        }
     }
+
     fn verify_tls12_signature(
         &self,
-        _m: &[u8],
-        _c: &CertificateDer<'_>,
-        _d: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
         Ok(HandshakeSignatureValid::assertion())
     }
+
     fn verify_tls13_signature(
         &self,
-        _m: &[u8],
-        _c: &CertificateDer<'_>,
-        _d: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
         Ok(HandshakeSignatureValid::assertion())
     }
+
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![
             SignatureScheme::RSA_PKCS1_SHA256,
@@ -46,11 +72,25 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-pub fn build_tls_connector() -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-        .with_no_client_auth();
+pub fn build_tls_connector(pinned_hash: Option<&str>) -> Arc<ClientConfig> {
+    let mut config = if let Some(hash) = pinned_hash {
+        // 使用自签证书并进行 Hash 固定校验
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+                expected_hash: hash.to_string(),
+            }))
+            .with_no_client_auth()
+    } else {
+        // 默认行为：严谨校验系统信任的 CA 证书与 SNI
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(config)
 }
