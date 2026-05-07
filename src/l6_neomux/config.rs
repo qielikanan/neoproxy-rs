@@ -1,4 +1,5 @@
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -9,6 +10,7 @@ pub struct Config {
     pub keep_alive_interval: Duration,
     pub keep_alive_timeout: Duration,
     pub max_stream_count: u32,
+    pub padding_update_tx: Option<UnboundedSender<String>>,
 }
 
 impl Default for Config {
@@ -21,6 +23,7 @@ impl Default for Config {
             keep_alive_interval: Duration::from_secs(15),
             keep_alive_timeout: Duration::from_secs(30),
             max_stream_count: 256,
+            padding_update_tx: None,
         }
     }
 }

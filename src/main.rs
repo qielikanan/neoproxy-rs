@@ -20,6 +20,7 @@ use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, RwLock};
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -88,7 +89,6 @@ async fn do_fallback(stream: TlsStream<tokio::net::TcpStream>, dest: String) {
         let (mut ri, mut wi) = tokio::io::split(stream);
         let (mut ro, mut wo) = tokio::io::split(target);
         let _ = tokio::try_join!(
-            // 浏览器到 Nginx 的方向 (通常是客户端主动发包，普通 copy 即可)
             async {
                 let _ = tokio::io::copy(&mut ri, &mut wo).await;
                 let _ = wo.shutdown().await;
@@ -98,7 +98,7 @@ async fn do_fallback(stream: TlsStream<tokio::net::TcpStream>, dest: String) {
                 let mut buf = [0u8; 8192];
                 loop {
                     match tokio::io::AsyncReadExt::read(&mut ro, &mut buf).await {
-                        Ok(0) => break, // Nginx 断开连接
+                        Ok(0) => break,
                         Ok(n) => {
                             if tokio::io::AsyncWriteExt::write_all(&mut wi, &buf[..n])
                                 .await
@@ -141,7 +141,7 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
         .jls_iv
         .unwrap_or_else(|| "3070111071563328618171495819203123318".to_string());
     let sni = app_cfg.sni.clone();
-    let _padding_script = app_cfg.padding.clone();
+    let padding_script = app_cfg.padding.clone();
     let security_mode = app_cfg.security.clone();
 
     let tls_config = if security_mode == "jls" {
@@ -180,6 +180,8 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
         let neomux_cfg_clone = neomux_cfg.clone();
         let mode_clone = security_mode.clone();
         let fallback_target = dest.clone();
+        // 克隆脚本以便在闭包中使用
+        let padding_script_clone = padding_script.clone();
 
         tokio::spawn(async move {
             let tls_stream = match accept_tls(&config, tcp_stream).await {
@@ -202,6 +204,9 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
                 Ok(s) => s,
                 Err(_) => return,
             };
+
+            // 新增：成功建立 NeoMux Session 后，服务端主动下发混淆脚本给客户端
+            session.send_padding_strategy(&padding_script_clone);
 
             loop {
                 let stream = match session.accept_stream().await {
@@ -227,7 +232,7 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
         .jls_iv
         .unwrap_or_else(|| "3070111071563328618171495819203123318".to_string());
     let security_mode = app_cfg.security.clone();
-    let padding_script = app_cfg.padding.clone();
+    let initial_padding_script = app_cfg.padding.clone();
     let pinnedhash = app_cfg.pinnedhash.clone();
 
     let tls_config = if security_mode == "jls" {
@@ -236,13 +241,44 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
         build_tls_connector(pinnedhash.as_deref())
     };
 
+    let global_scheme = Arc::new(RwLock::new(
+        parse_script(&initial_padding_script).unwrap_or_else(|_| l5_shaper::Scheme {
+            instructions: vec![],
+        }),
+    ));
+
+    // 建立一个通信管道供底层的 L6 往上层传递更新后的 Script
+    let (padding_tx, mut padding_rx) = mpsc::unbounded_channel::<String>();
+
+    let scheme_updater = global_scheme.clone();
+    tokio::spawn(async move {
+        while let Some(new_script) = padding_rx.recv().await {
+            match parse_script(&new_script) {
+                Ok(new_scheme) => {
+                    let mut scheme_lock = scheme_updater.write().await;
+                    *scheme_lock = new_scheme;
+                    tracing::info!("✅ [L5 Shaper] 动态 Padding 策略热更新成功，将在新连接中生效");
+                }
+                Err(e) => {
+                    tracing::error!("❌ [L5 Shaper] 接收到的 Padding 策略解析失败: {:?}", e);
+                }
+            }
+        }
+    });
+
+    let padding_tx_factory = padding_tx.clone();
+    let global_scheme_factory = global_scheme.clone();
+
     let dial_func: l7_router::session_pool::DialFunc = Arc::new(move || {
         let remote = remote_addr.clone();
         let sni_clone = sni.clone();
         let pwd = password.clone();
         let config_clone = tls_config.clone();
-        let script = padding_script.clone();
         let mode_clone = security_mode.clone();
+
+        // 为闭包准备管道和锁的克隆
+        let padding_tx_clone = padding_tx_factory.clone();
+        let scheme_clone = global_scheme_factory.clone();
 
         Box::pin(async move {
             let tcp = tokio::net::TcpStream::connect(&remote).await?;
@@ -255,14 +291,21 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
                 }
             }
 
-            let scheme = parse_script(&script).ok();
-            let shaper = ShaperStream::new(tls, scheme);
+            let current_scheme = {
+                let lock = scheme_clone.read().await;
+                lock.clone()
+            };
+
+            let shaper = ShaperStream::new(tls, Some(current_scheme));
+
             let mut cfg = NeoMuxConfig::default();
             cfg.is_client = true;
             if mode_clone == "tls" {
                 cfg.require_auth = true;
                 cfg.password = pwd;
             }
+
+            cfg.padding_update_tx = Some(padding_tx_clone);
 
             Session::new(shaper, cfg).await
         })

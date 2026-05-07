@@ -4,7 +4,7 @@ use super::frame::{
     FLAG_RST, FLAG_SYN, HEADER_SIZE,
 };
 use super::stream::{Stream, StreamInternal};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use clashmap::ClashMap;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -21,9 +21,7 @@ pub(crate) struct SessionState {
     pub global_send_window: AtomicI32,
     pub stream_count: AtomicU32,
 
-    // 高性能优化：精准唤醒队列，解决惊群效应
     pub global_tx_wakers: StdMutex<Vec<Waker>>,
-    // 高性能优化：写就绪通知与队列 (拉模式)
     pub write_notify: Arc<Notify>,
     pub ready_streams: StdMutex<VecDeque<u32>>,
 }
@@ -85,7 +83,6 @@ impl Session {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        // 优先队列仅用于极少量、关键的控制帧 (RST, WINDOW_UPDATE)
         let (prio_tx, prio_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::channel(128);
         let (fallback_tx, fallback_rx) = mpsc::channel::<tokio::net::tcp::OwnedReadHalf>(1);
@@ -170,7 +167,20 @@ impl Session {
         Ok(Stream { internal })
     }
 
-    /// 高效的事件驱动写循环
+    pub fn send_padding_strategy(&self, script: &str) {
+        let mut payload = BytesMut::with_capacity(1 + script.len());
+        payload.put_u8(0x01); // 0x01 前缀表示 Padding Script
+        payload.put_slice(script.as_bytes());
+
+        let _ = self.prio_tx.send(Frame {
+            cmd: CMD_CTRL,
+            flags: 0,
+            length: payload.len() as u16,
+            stream_id: 0,
+            payload: Some(payload.freeze()),
+        });
+    }
+
     async fn write_loop<W>(
         writer: &mut W,
         state: Arc<SessionState>,
@@ -180,7 +190,6 @@ impl Session {
         W: AsyncWrite + Unpin,
     {
         let mut fallback_active = true;
-        // 使用一个大的统一缓冲区合并系统调用
         let mut write_buf = BytesMut::with_capacity(65536 * 2);
 
         loop {
@@ -205,7 +214,6 @@ impl Session {
                     }
                 }
 
-                // 处理高优先级控制帧
                 Some(f) = prio_rx.recv() => {
                     let mut header = [0u8; HEADER_SIZE];
                     f.encode_header_to_slice(&mut header);
@@ -215,7 +223,6 @@ impl Session {
                     }
                 }
 
-                // 处理大批量数据流就绪事件 (拉模式)
                 _ = state.write_notify.notified() => {
                     let mut frames = Vec::new();
                     {
@@ -224,7 +231,6 @@ impl Session {
                             if let Some(stream) = state.get_stream(id) {
                                 let mut tx_state = stream.state.lock().unwrap();
                                 frames.extend(tx_state.tx_queue.drain(..));
-                                // 缓冲区腾出空间，唤醒等待写入的流
                                 if let Some(w) = tx_state.tx_waker.take() {
                                     w.wake();
                                 }
@@ -239,7 +245,6 @@ impl Session {
                         if let Some(p) = f.payload {
                             write_buf.extend_from_slice(&p);
                         }
-                        // 防止缓冲区暴涨，分批写出
                         if write_buf.len() >= 65536 {
                             if writer.write_all(&write_buf).await.is_err() { return; }
                             write_buf.clear();
@@ -249,7 +254,6 @@ impl Session {
                 else => break,
             }
 
-            // 清理并刷入内核
             if !write_buf.is_empty() {
                 if writer.write_all(&write_buf).await.is_err() {
                     break;
@@ -278,7 +282,6 @@ impl Session {
                     match Frame::decode_header(&read_buf[..HEADER_SIZE]) {
                         Ok(h) => h,
                         Err(_) => {
-                            // 协议解析失败，触发 Fallback 机制
                             if let Some(tx) = fallback_tx.take() {
                                 if !config.is_client && !config.fallback_target.is_empty() {
                                     if let Ok(target_stream) =
@@ -287,7 +290,7 @@ impl Session {
                                     {
                                         let (target_rh, mut target_wh) = target_stream.into_split();
                                         let _ = tx.try_send(target_rh);
-                                        let _ = target_wh.write_all(&read_buf).await; // 转移残留数据
+                                        let _ = target_wh.write_all(&read_buf).await;
                                         let _ = tokio::io::copy(reader, &mut target_wh).await;
                                         let _ = target_wh.shutdown().await;
                                     }
@@ -332,10 +335,6 @@ impl Session {
                                         "⚠️ [Security] 收到非法连接，哈希鉴权失败，触发伪装回落机制。"
                                     );
                                 }
-                            } else {
-                                tracing::warn!(
-                                    "⚠️ [Security] 收到畸形首包，长度不足以进行哈希校验。"
-                                );
                             }
                         }
                     }
@@ -344,7 +343,6 @@ impl Session {
                         auth_passed = true;
                         continue;
                     } else {
-                        // 回落逻辑
                         if let Some(tx) = fallback_tx.take() {
                             if !config.is_client && !config.fallback_target.is_empty() {
                                 if let Ok(target_stream) =
@@ -388,6 +386,20 @@ impl Session {
                             stream_id: 0,
                             payload: None,
                         });
+                    } else if cmd == CMD_CTRL {
+                        if let Some(p) = payload {
+                            if !p.is_empty() && p[0] == 0x01 {
+                                if let Ok(script_str) = String::from_utf8(p[1..].to_vec()) {
+                                    tracing::info!(
+                                        "🔄 [NeoMux] 收到服务端下发的新 Padding 策略: {}",
+                                        script_str
+                                    );
+                                    if let Some(tx) = &config.padding_update_tx {
+                                        let _ = tx.send(script_str);
+                                    }
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
