@@ -10,7 +10,7 @@ use l4_security::server::{
     build_tls_acceptor_jls_generated,
 };
 use l4_security::tokio_jls::TlsStream;
-use l5_shaper::{parse_script, ShaperStream};
+use l5_shaper::parse_script;
 use l6_neomux::{Config as NeoMuxConfig, Session};
 use l7_router::{handle_socks5, handle_stream, PoolConfig, SessionPool};
 use serde::Deserialize;
@@ -180,7 +180,6 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
         let neomux_cfg_clone = neomux_cfg.clone();
         let mode_clone = security_mode.clone();
         let fallback_target = dest.clone();
-        // 克隆脚本以便在闭包中使用
         let padding_script_clone = padding_script.clone();
 
         tokio::spawn(async move {
@@ -199,13 +198,12 @@ async fn run_server(app_cfg: AppConfig) -> Result<()> {
                 }
             }
 
-            let shaper_stream = ShaperStream::new(tls_stream, None);
-            let session = match Session::new(shaper_stream, neomux_cfg_clone).await {
+            // 移除独立的 Shaper 包装层，架构合二为一
+            let session = match Session::new(tls_stream, neomux_cfg_clone).await {
                 Ok(s) => s,
                 Err(_) => return,
             };
 
-            // 新增：成功建立 NeoMux Session 后，服务端主动下发混淆脚本给客户端
             session.send_padding_strategy(&padding_script_clone);
 
             loop {
@@ -247,7 +245,6 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
         }),
     ));
 
-    // 建立一个通信管道供底层的 L6 往上层传递更新后的 Script
     let (padding_tx, mut padding_rx) = mpsc::unbounded_channel::<String>();
 
     let scheme_updater = global_scheme.clone();
@@ -276,7 +273,6 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
         let config_clone = tls_config.clone();
         let mode_clone = security_mode.clone();
 
-        // 为闭包准备管道和锁的克隆
         let padding_tx_clone = padding_tx_factory.clone();
         let scheme_clone = global_scheme_factory.clone();
 
@@ -296,8 +292,6 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
                 lock.clone()
             };
 
-            let shaper = ShaperStream::new(tls, Some(current_scheme));
-
             let mut cfg = NeoMuxConfig::default();
             cfg.is_client = true;
             if mode_clone == "tls" {
@@ -306,8 +300,10 @@ async fn run_client(app_cfg: AppConfig) -> Result<()> {
             }
 
             cfg.padding_update_tx = Some(padding_tx_clone);
+            // 完美下放，由 NeoMux L6 亲自执行流量整形，杜绝帧越界
+            cfg.scheme = Some(current_scheme);
 
-            Session::new(shaper, cfg).await
+            Session::new(tls, cfg).await
         })
     });
 

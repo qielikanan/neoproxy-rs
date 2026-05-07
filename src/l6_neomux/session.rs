@@ -4,8 +4,10 @@ use super::frame::{
     FLAG_RST, FLAG_SYN, HEADER_SIZE,
 };
 use super::stream::{Stream, StreamInternal};
-use bytes::{BufMut, BytesMut};
+use crate::l5_shaper::{ActionType, ConnContext, SchemeIterator};
+use bytes::{BufMut, Bytes, BytesMut};
 use clashmap::ClashMap;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::io::{self};
@@ -117,8 +119,9 @@ impl Session {
         let (mut rh, mut wh) = tokio::io::split(conn);
 
         let write_state = state.clone();
+        let write_cfg = config.clone();
         tokio::spawn(async move {
-            Self::write_loop(&mut wh, write_state, prio_rx, fallback_rx).await;
+            Self::write_loop(&mut wh, write_state, prio_rx, fallback_rx, write_cfg).await;
         });
 
         let read_state = state.clone();
@@ -154,22 +157,27 @@ impl Session {
             self.state.clone(),
         ));
 
+        if self
+            .prio_tx
+            .send(Frame {
+                cmd: CMD_CTRL,
+                flags: FLAG_SYN,
+                length: 0,
+                stream_id,
+                payload: None,
+            })
+            .is_err()
+        {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session is dead"));
+        }
+
         self.state.insert_stream(stream_id, internal.clone());
-
-        let _ = self.prio_tx.send(Frame {
-            cmd: CMD_CTRL,
-            flags: FLAG_SYN,
-            length: 0,
-            stream_id,
-            payload: None,
-        });
-
         Ok(Stream { internal })
     }
 
     pub fn send_padding_strategy(&self, script: &str) {
         let mut payload = BytesMut::with_capacity(1 + script.len());
-        payload.put_u8(0x01); // 0x01 前缀表示 Padding Script
+        payload.put_u8(0x01);
         payload.put_slice(script.as_bytes());
 
         let _ = self.prio_tx.send(Frame {
@@ -181,16 +189,26 @@ impl Session {
         });
     }
 
+    /// 核心修复：将 AST 整形引擎无缝融入多路复用发送轮询，杜绝帧边界被暴力撕裂
     async fn write_loop<W>(
         writer: &mut W,
         state: Arc<SessionState>,
         mut prio_rx: mpsc::UnboundedReceiver<Frame>,
         mut fallback_rx: mpsc::Receiver<tokio::net::tcp::OwnedReadHalf>,
+        config: Config,
     ) where
         W: AsyncWrite + Unpin,
     {
         let mut fallback_active = true;
         let mut write_buf = BytesMut::with_capacity(65536 * 2);
+
+        // 初始化 L5 AST 引擎状态
+        let mut scheme_iter = config.scheme.map(SchemeIterator::new);
+        let mut ctx = ConnContext::new();
+        let mut pending_action: Option<(ActionType, usize)> = None;
+
+        let mut waste_pool = vec![0u8; 65535];
+        rand::thread_rng().fill_bytes(&mut waste_pool);
 
         loop {
             tokio::select! {
@@ -224,13 +242,13 @@ impl Session {
                 }
 
                 _ = state.write_notify.notified() => {
-                    let mut frames = Vec::new();
+                    let mut local_queue = VecDeque::new();
                     {
                         let mut ready = state.ready_streams.lock().unwrap();
                         while let Some(id) = ready.pop_front() {
                             if let Some(stream) = state.get_stream(id) {
                                 let mut tx_state = stream.state.lock().unwrap();
-                                frames.extend(tx_state.tx_queue.drain(..));
+                                local_queue.extend(tx_state.tx_queue.drain(..));
                                 if let Some(w) = tx_state.tx_waker.take() {
                                     w.wake();
                                 }
@@ -238,13 +256,107 @@ impl Session {
                         }
                     }
 
-                    for f in frames {
-                        let mut header = [0u8; HEADER_SIZE];
-                        f.encode_header_to_slice(&mut header);
-                        write_buf.extend_from_slice(&header);
-                        if let Some(p) = f.payload {
-                            write_buf.extend_from_slice(&p);
+                    // 结合 AST 指令智能拆装帧结构
+                    while !local_queue.is_empty()
+                        || matches!(pending_action, Some((ActionType::Inject, _)))
+                        || (scheme_iter.is_some() && pending_action.is_none())
+                    {
+                        if pending_action.is_none() {
+                            if let Some(iter) = &mut scheme_iter {
+                                let (a, l) = iter.next_action(&mut ctx);
+                                if a == ActionType::Done {
+                                    scheme_iter = None;
+                                } else {
+                                    pending_action = Some((a, l));
+                                }
+                            }
                         }
+
+                        if let Some((action, mut target_len)) = pending_action.take() {
+                            match action {
+                                ActionType::Inject => {
+                                    let payload_len = target_len.saturating_sub(8);
+                                    let payload_len = std::cmp::min(payload_len, 65535);
+                                    let mut header = [0u8; HEADER_SIZE];
+                                    let f = Frame {
+                                        cmd: CMD_WASTE,
+                                        flags: 0,
+                                        length: payload_len as u16,
+                                        stream_id: 0,
+                                        payload: Some(Bytes::copy_from_slice(&waste_pool[..payload_len])),
+                                    };
+                                    f.encode_header_to_slice(&mut header);
+                                    write_buf.extend_from_slice(&header);
+                                    write_buf.extend_from_slice(f.payload.as_ref().unwrap());
+                                }
+                                ActionType::SendData => {
+                                    if local_queue.is_empty() {
+                                        pending_action = Some((action, target_len));
+                                        break;
+                                    }
+                                    let frame = local_queue.pop_front().unwrap();
+                                    let frame_len = if frame.payload.is_some() { frame.length as usize } else { 0 };
+
+                                    // 数据帧超长，执行精确切割 (Split)，保障 TCP 包级碎片化
+                                    if frame_len > target_len && frame.cmd == CMD_DATA {
+                                        let payload = frame.payload.unwrap();
+                                        let first_part = payload.slice(..target_len);
+                                        let second_part = payload.slice(target_len..);
+
+                                        let flags = frame.flags;
+                                        let first_flags = flags & !FLAG_FIN;
+                                        let second_flags = flags & !FLAG_SYN;
+
+                                        let f1 = Frame {
+                                            cmd: frame.cmd,
+                                            flags: first_flags,
+                                            length: target_len as u16,
+                                            stream_id: frame.stream_id,
+                                            payload: Some(first_part),
+                                        };
+                                        local_queue.push_front(Frame {
+                                            cmd: frame.cmd,
+                                            flags: second_flags,
+                                            length: second_part.len() as u16,
+                                            stream_id: frame.stream_id,
+                                            payload: Some(second_part),
+                                        });
+
+                                        let mut header = [0u8; HEADER_SIZE];
+                                        f1.encode_header_to_slice(&mut header);
+                                        write_buf.extend_from_slice(&header);
+                                        write_buf.extend_from_slice(f1.payload.as_ref().unwrap());
+                                    } else {
+                                        let mut header = [0u8; HEADER_SIZE];
+                                        frame.encode_header_to_slice(&mut header);
+                                        write_buf.extend_from_slice(&header);
+                                        if let Some(p) = &frame.payload {
+                                            write_buf.extend_from_slice(p);
+                                        }
+
+                                        if frame.cmd == CMD_DATA {
+                                            target_len = target_len.saturating_sub(frame_len);
+                                            if target_len > 0 {
+                                                pending_action = Some((ActionType::SendData, target_len));
+                                            }
+                                        } else {
+                                            pending_action = Some((ActionType::SendData, target_len));
+                                        }
+                                    }
+                                }
+                                ActionType::Done => unreachable!(),
+                            }
+                        } else {
+                            while let Some(frame) = local_queue.pop_front() {
+                                let mut header = [0u8; HEADER_SIZE];
+                                frame.encode_header_to_slice(&mut header);
+                                write_buf.extend_from_slice(&header);
+                                if let Some(p) = frame.payload {
+                                    write_buf.extend_from_slice(&p);
+                                }
+                            }
+                        }
+
                         if write_buf.len() >= 65536 {
                             if writer.write_all(&write_buf).await.is_err() { return; }
                             write_buf.clear();
@@ -464,10 +576,10 @@ impl Session {
                         }
                     }
                 }
-            } // end while
+            }
 
             if reader.read_buf(&mut read_buf).await.unwrap_or(0) == 0 {
-                break; // Socket 关闭
+                break;
             }
         }
 

@@ -1,3 +1,4 @@
+use crate::l5_shaper::Scheme;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -11,6 +12,7 @@ pub struct Config {
     pub keep_alive_timeout: Duration,
     pub max_stream_count: u32,
     pub padding_update_tx: Option<UnboundedSender<String>>,
+    pub scheme: Option<Scheme>,
 }
 
 impl Default for Config {
@@ -24,6 +26,7 @@ impl Default for Config {
             keep_alive_timeout: Duration::from_secs(30),
             max_stream_count: 256,
             padding_update_tx: None,
+            scheme: None,
         }
     }
 }
