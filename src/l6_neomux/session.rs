@@ -176,10 +176,25 @@ impl Session {
     }
 
     pub fn send_padding_strategy(&self, script: &str) {
+        if script.is_empty() {
+            return;
+        }
         let mut payload = BytesMut::with_capacity(1 + script.len());
         payload.put_u8(0x01);
         payload.put_slice(script.as_bytes());
 
+        // 根据 XTLS-Vision 理论，拉伸至 900~1400 之间
+        let target_total = (rand::random::<u32>() % 500) + 900;
+        let ctrl_len = HEADER_SIZE + payload.len();
+        let mut waste_len = target_total as usize - ctrl_len - HEADER_SIZE;
+        if waste_len < 20 {
+            waste_len = (rand::random::<usize>() % 50) + 20;
+        }
+
+        let mut waste_payload = vec![0u8; waste_len];
+        rand::thread_rng().fill_bytes(&mut waste_payload);
+
+        // 连续推入优先级队列，由于写循环已具备贪婪特性，它们会被百分百融合在一起发出
         let _ = self.prio_tx.send(Frame {
             cmd: CMD_CTRL,
             flags: 0,
@@ -187,9 +202,16 @@ impl Session {
             stream_id: 0,
             payload: Some(payload.freeze()),
         });
+
+        let _ = self.prio_tx.send(Frame {
+            cmd: CMD_WASTE,
+            flags: 0,
+            length: waste_len as u16,
+            stream_id: 0,
+            payload: Some(Bytes::from(waste_payload)),
+        });
     }
 
-    /// 核心修复：将 AST 整形引擎无缝融入多路复用发送轮询，杜绝帧边界被暴力撕裂
     async fn write_loop<W>(
         writer: &mut W,
         state: Arc<SessionState>,
@@ -202,7 +224,6 @@ impl Session {
         let mut fallback_active = true;
         let mut write_buf = BytesMut::with_capacity(65536 * 2);
 
-        // 初始化 L5 AST 引擎状态
         let mut scheme_iter = config.scheme.map(SchemeIterator::new);
         let mut ctx = ConnContext::new();
         let mut pending_action: Option<(ActionType, usize)> = None;
@@ -211,6 +232,7 @@ impl Session {
         rand::thread_rng().fill_bytes(&mut waste_pool);
 
         loop {
+            // 步骤一：阻塞等待任意事件唤醒
             tokio::select! {
                 biased;
                 opt_rh = fallback_rx.recv(), if fallback_active => {
@@ -231,139 +253,185 @@ impl Session {
                         continue;
                     }
                 }
+                opt_f = prio_rx.recv() => {
+                    if let Some(f) = opt_f {
+                        let mut header = [0u8; HEADER_SIZE];
+                        f.encode_header_to_slice(&mut header);
+                        write_buf.extend_from_slice(&header);
+                        if let Some(p) = f.payload { write_buf.extend_from_slice(&p); }
+                    } else { return; }
+                }
+                _ = state.write_notify.notified() => {
+                    // 仅唤醒，数据处理交由下方统筹
+                }
+            }
 
-                Some(f) = prio_rx.recv() => {
-                    let mut header = [0u8; HEADER_SIZE];
-                    f.encode_header_to_slice(&mut header);
-                    write_buf.extend_from_slice(&header);
-                    if let Some(p) = f.payload {
-                        write_buf.extend_from_slice(&p);
+            // 步骤二：极致的贪婪汲取 (Greedy Coalescing)
+            // 无锁榨干所有高优先级控制帧，确保策略更新、ACK等控制帧能完美抱团，杜绝碎片化 TLS 记录
+            while let Ok(f) = prio_rx.try_recv() {
+                let mut header = [0u8; HEADER_SIZE];
+                f.encode_header_to_slice(&mut header);
+                write_buf.extend_from_slice(&header);
+                if let Some(p) = f.payload {
+                    write_buf.extend_from_slice(&p);
+                }
+            }
+
+            // 步骤三：汲取用户数据队列
+            let mut local_queue = VecDeque::new();
+            {
+                let mut ready = state.ready_streams.lock().unwrap();
+                while let Some(id) = ready.pop_front() {
+                    if let Some(stream) = state.get_stream(id) {
+                        let mut tx_state = stream.state.lock().unwrap();
+                        local_queue.extend(tx_state.tx_queue.drain(..));
+                        if let Some(w) = tx_state.tx_waker.take() {
+                            w.wake();
+                        }
+                    }
+                }
+            }
+
+            // 步骤四：与 AST 引擎深度接轨的流量整形
+            while !local_queue.is_empty()
+                || matches!(pending_action, Some((ActionType::Inject, _)))
+                || (scheme_iter.is_some() && pending_action.is_none())
+            {
+                if pending_action.is_none() {
+                    if let Some(iter) = &mut scheme_iter {
+                        let (a, l) = iter.next_action(&mut ctx);
+                        if a == ActionType::Done {
+                            scheme_iter = None;
+                        } else {
+                            pending_action = Some((a, l));
+                        }
                     }
                 }
 
-                _ = state.write_notify.notified() => {
-                    let mut local_queue = VecDeque::new();
-                    {
-                        let mut ready = state.ready_streams.lock().unwrap();
-                        while let Some(id) = ready.pop_front() {
-                            if let Some(stream) = state.get_stream(id) {
-                                let mut tx_state = stream.state.lock().unwrap();
-                                local_queue.extend(tx_state.tx_queue.drain(..));
-                                if let Some(w) = tx_state.tx_waker.take() {
-                                    w.wake();
-                                }
-                            }
+                if let Some((action, target_len)) = pending_action.take() {
+                    match action {
+                        ActionType::Inject => {
+                            let payload_len = target_len.saturating_sub(8);
+                            let payload_len = std::cmp::min(payload_len, 65535);
+                            let mut header = [0u8; HEADER_SIZE];
+                            let f = Frame {
+                                cmd: CMD_WASTE,
+                                flags: 0,
+                                length: payload_len as u16,
+                                stream_id: 0,
+                                payload: Some(Bytes::copy_from_slice(&waste_pool[..payload_len])),
+                            };
+                            f.encode_header_to_slice(&mut header);
+                            write_buf.extend_from_slice(&header);
+                            write_buf.extend_from_slice(f.payload.as_ref().unwrap());
                         }
-                    }
-
-                    // 结合 AST 指令智能拆装帧结构
-                    while !local_queue.is_empty()
-                        || matches!(pending_action, Some((ActionType::Inject, _)))
-                        || (scheme_iter.is_some() && pending_action.is_none())
-                    {
-                        if pending_action.is_none() {
-                            if let Some(iter) = &mut scheme_iter {
-                                let (a, l) = iter.next_action(&mut ctx);
-                                if a == ActionType::Done {
-                                    scheme_iter = None;
-                                } else {
-                                    pending_action = Some((a, l));
-                                }
+                        ActionType::SendData => {
+                            if local_queue.is_empty() {
+                                let pad_payload = target_len.saturating_sub(8);
+                                let pad_payload = std::cmp::min(pad_payload, 65535);
+                                let mut header = [0u8; HEADER_SIZE];
+                                let f_waste = Frame {
+                                    cmd: CMD_WASTE,
+                                    flags: 0,
+                                    length: pad_payload as u16,
+                                    stream_id: 0,
+                                    payload: Some(Bytes::copy_from_slice(
+                                        &waste_pool[..pad_payload],
+                                    )),
+                                };
+                                f_waste.encode_header_to_slice(&mut header);
+                                write_buf.extend_from_slice(&header);
+                                write_buf.extend_from_slice(f_waste.payload.as_ref().unwrap());
+                                break; // 满足后退出内层循环，进入发送阶段
                             }
-                        }
 
-                        if let Some((action, mut target_len)) = pending_action.take() {
-                            match action {
-                                ActionType::Inject => {
-                                    let payload_len = target_len.saturating_sub(8);
-                                    let payload_len = std::cmp::min(payload_len, 65535);
-                                    let mut header = [0u8; HEADER_SIZE];
-                                    let f = Frame {
-                                        cmd: CMD_WASTE,
-                                        flags: 0,
-                                        length: payload_len as u16,
-                                        stream_id: 0,
-                                        payload: Some(Bytes::copy_from_slice(&waste_pool[..payload_len])),
-                                    };
-                                    f.encode_header_to_slice(&mut header);
-                                    write_buf.extend_from_slice(&header);
-                                    write_buf.extend_from_slice(f.payload.as_ref().unwrap());
-                                }
-                                ActionType::SendData => {
-                                    if local_queue.is_empty() {
-                                        pending_action = Some((action, target_len));
-                                        break;
-                                    }
-                                    let frame = local_queue.pop_front().unwrap();
-                                    let frame_len = if frame.payload.is_some() { frame.length as usize } else { 0 };
+                            let frame = local_queue.pop_front().unwrap();
+                            let frame_len = if frame.payload.is_some() {
+                                frame.length as usize
+                            } else {
+                                0
+                            };
 
-                                    // 数据帧超长，执行精确切割 (Split)，保障 TCP 包级碎片化
-                                    if frame_len > target_len && frame.cmd == CMD_DATA {
-                                        let payload = frame.payload.unwrap();
-                                        let first_part = payload.slice(..target_len);
-                                        let second_part = payload.slice(target_len..);
+                            if frame_len > target_len && frame.cmd == CMD_DATA {
+                                let payload = frame.payload.unwrap();
+                                let first_part = payload.slice(..target_len);
+                                let second_part = payload.slice(target_len..);
 
-                                        let flags = frame.flags;
-                                        let first_flags = flags & !FLAG_FIN;
-                                        let second_flags = flags & !FLAG_SYN;
+                                let flags = frame.flags;
+                                let first_flags = flags & !FLAG_FIN;
+                                let second_flags = flags & !FLAG_SYN;
 
-                                        let f1 = Frame {
-                                            cmd: frame.cmd,
-                                            flags: first_flags,
-                                            length: target_len as u16,
-                                            stream_id: frame.stream_id,
-                                            payload: Some(first_part),
-                                        };
-                                        local_queue.push_front(Frame {
-                                            cmd: frame.cmd,
-                                            flags: second_flags,
-                                            length: second_part.len() as u16,
-                                            stream_id: frame.stream_id,
-                                            payload: Some(second_part),
-                                        });
+                                let f1 = Frame {
+                                    cmd: frame.cmd,
+                                    flags: first_flags,
+                                    length: target_len as u16,
+                                    stream_id: frame.stream_id,
+                                    payload: Some(first_part),
+                                };
+                                local_queue.push_front(Frame {
+                                    cmd: frame.cmd,
+                                    flags: second_flags,
+                                    length: second_part.len() as u16,
+                                    stream_id: frame.stream_id,
+                                    payload: Some(second_part),
+                                });
 
-                                        let mut header = [0u8; HEADER_SIZE];
-                                        f1.encode_header_to_slice(&mut header);
-                                        write_buf.extend_from_slice(&header);
-                                        write_buf.extend_from_slice(f1.payload.as_ref().unwrap());
-                                    } else {
-                                        let mut header = [0u8; HEADER_SIZE];
-                                        frame.encode_header_to_slice(&mut header);
-                                        write_buf.extend_from_slice(&header);
-                                        if let Some(p) = &frame.payload {
-                                            write_buf.extend_from_slice(p);
-                                        }
-
-                                        if frame.cmd == CMD_DATA {
-                                            target_len = target_len.saturating_sub(frame_len);
-                                            if target_len > 0 {
-                                                pending_action = Some((ActionType::SendData, target_len));
-                                            }
-                                        } else {
-                                            pending_action = Some((ActionType::SendData, target_len));
-                                        }
-                                    }
-                                }
-                                ActionType::Done => unreachable!(),
-                            }
-                        } else {
-                            while let Some(frame) = local_queue.pop_front() {
+                                let mut header = [0u8; HEADER_SIZE];
+                                f1.encode_header_to_slice(&mut header);
+                                write_buf.extend_from_slice(&header);
+                                write_buf.extend_from_slice(f1.payload.as_ref().unwrap());
+                            } else {
                                 let mut header = [0u8; HEADER_SIZE];
                                 frame.encode_header_to_slice(&mut header);
                                 write_buf.extend_from_slice(&header);
-                                if let Some(p) = frame.payload {
-                                    write_buf.extend_from_slice(&p);
+                                if let Some(p) = &frame.payload {
+                                    write_buf.extend_from_slice(p);
+                                }
+
+                                if frame.cmd == CMD_DATA {
+                                    let shortfall = target_len.saturating_sub(frame_len);
+                                    if shortfall > 0 {
+                                        let pad_payload = shortfall.saturating_sub(8);
+                                        let pad_payload = std::cmp::min(pad_payload, 65535);
+                                        let mut w_header = [0u8; HEADER_SIZE];
+                                        let f_waste = Frame {
+                                            cmd: CMD_WASTE,
+                                            flags: 0,
+                                            length: pad_payload as u16,
+                                            stream_id: 0,
+                                            payload: Some(Bytes::copy_from_slice(
+                                                &waste_pool[..pad_payload],
+                                            )),
+                                        };
+                                        f_waste.encode_header_to_slice(&mut w_header);
+                                        write_buf.extend_from_slice(&w_header);
+                                        write_buf
+                                            .extend_from_slice(f_waste.payload.as_ref().unwrap());
+                                    }
+                                } else {
+                                    pending_action = Some((ActionType::SendData, target_len));
                                 }
                             }
                         }
-
-                        if write_buf.len() >= 65536 {
-                            if writer.write_all(&write_buf).await.is_err() { return; }
-                            write_buf.clear();
+                        ActionType::Done => unreachable!(),
+                    }
+                } else {
+                    while let Some(frame) = local_queue.pop_front() {
+                        let mut header = [0u8; HEADER_SIZE];
+                        frame.encode_header_to_slice(&mut header);
+                        write_buf.extend_from_slice(&header);
+                        if let Some(p) = frame.payload {
+                            write_buf.extend_from_slice(&p);
                         }
                     }
                 }
-                else => break,
+
+                if write_buf.len() >= 65536 {
+                    if writer.write_all(&write_buf).await.is_err() {
+                        return;
+                    }
+                    write_buf.clear();
+                }
             }
 
             if !write_buf.is_empty() {

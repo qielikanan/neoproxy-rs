@@ -4,6 +4,7 @@ use super::frame::{
 };
 use super::session::SessionState;
 use bytes::{BufMut, Bytes, BytesMut};
+use rand::RngCore; 
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::Ordering;
@@ -94,12 +95,17 @@ impl StreamInternal {
         state.recv_window -= data.len() as i32;
         if state.rx_queue.len() > 8192 || state.recv_window < 0 {
             state.reset = true;
+
+            let pad_len = (rand::random::<usize>() % 80) + 10;
+            let mut pad = vec![0u8; pad_len];
+            rand::thread_rng().fill_bytes(&mut pad);
+
             let _ = self.prio_tx.send(Frame {
                 cmd: CMD_CTRL,
                 flags: FLAG_RST,
-                length: 0,
+                length: pad_len as u16,
                 stream_id: self.id,
-                payload: None,
+                payload: Some(Bytes::from(pad)),
             });
             self.session_state.remove_stream(self.id);
             self.wake_rx(&mut state);
@@ -119,22 +125,33 @@ impl StreamInternal {
     }
 
     pub fn send_window_update(&self, delta: u32) {
-        let mut p = BytesMut::with_capacity(4);
+        let pad_len = rand::random::<usize>() % 40;
+        let mut p = BytesMut::with_capacity(4 + pad_len);
         p.put_u32(delta);
+        let mut pad = vec![0u8; pad_len];
+        rand::thread_rng().fill_bytes(&mut pad);
+        p.extend_from_slice(&pad);
+
         let _ = self.prio_tx.send(Frame {
             cmd: CMD_WINDOW_UPDATE,
             flags: 0,
-            length: 4,
+            length: (4 + pad_len) as u16,
             stream_id: self.id,
             payload: Some(p.freeze()),
         });
 
-        let mut gp = BytesMut::with_capacity(4);
+        // 修复全局窗口更新控制帧裸奔：注入 0~39 字节随机噪音
+        let g_pad_len = rand::random::<usize>() % 40;
+        let mut gp = BytesMut::with_capacity(4 + g_pad_len);
         gp.put_u32(delta);
+        let mut g_pad = vec![0u8; g_pad_len];
+        rand::thread_rng().fill_bytes(&mut g_pad);
+        gp.extend_from_slice(&g_pad);
+
         let _ = self.prio_tx.send(Frame {
             cmd: CMD_WINDOW_UPDATE,
             flags: 0,
-            length: 4,
+            length: (4 + g_pad_len) as u16,
             stream_id: 0,
             payload: Some(gp.freeze()),
         });
@@ -297,12 +314,16 @@ impl AsyncWrite for Stream {
         let mut state = self.internal.state.lock().unwrap();
         if !state.write_closed && !state.reset {
             state.write_closed = true;
+            let pad_len = (rand::random::<usize>() % 80) + 10;
+            let mut pad = vec![0u8; pad_len];
+            rand::thread_rng().fill_bytes(&mut pad);
+
             let _ = self.internal.prio_tx.send(Frame {
                 cmd: CMD_CTRL,
                 flags: FLAG_FIN,
-                length: 0,
+                length: pad_len as u16,
                 stream_id: self.internal.id,
-                payload: None,
+                payload: Some(Bytes::from(pad)),
             });
             self.internal.session_state.remove_stream(self.internal.id);
         }
@@ -315,12 +336,17 @@ impl Drop for Stream {
         let mut state = self.internal.state.lock().unwrap();
         if !state.write_closed && !state.reset {
             state.reset = true;
+
+            let pad_len = (rand::random::<usize>() % 80) + 10;
+            let mut pad = vec![0u8; pad_len];
+            rand::thread_rng().fill_bytes(&mut pad);
+
             let _ = self.internal.prio_tx.send(Frame {
                 cmd: CMD_CTRL,
                 flags: FLAG_RST,
-                length: 0,
+                length: pad_len as u16,
                 stream_id: self.internal.id,
-                payload: None,
+                payload: Some(Bytes::from(pad)),
             });
             self.internal.session_state.remove_stream(self.internal.id);
         }
